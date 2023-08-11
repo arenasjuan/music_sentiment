@@ -1,5 +1,24 @@
 import os
+import tarfile
 import pandas as pd
+
+
+# Accounting for compressed files if running code from github repo
+def extract_tar(file_path, destination):
+    compression_mode = "r:gz" if file_path.endswith(".tar.gz") else "r:bz2"
+    try:
+        with tarfile.open(file_path, compression_mode) as file:
+            file.extractall(path=destination)
+    except Exception as e:
+        print(f"Error while extracting {file_path}: {e}")
+
+if not os.path.exists("./features") and os.path.exists("./features.tar.bz2"):
+    print("Extracting features.tar.bz2...")
+    extract_tar("./features.tar.bz2", ".")
+
+if not os.path.exists("./annotations") and os.path.exists("./annotations.tar.gz"):
+    print("Extracting annotations.tar.gz...")
+    extract_tar("./annotations.tar.gz", ".")
 
 FEATURES_DIR = "./features"
 ANNOTATIONS_AROUSAL = "./annotations/annotations averaged per song/dynamic (per second annotations)/arousal.csv"
