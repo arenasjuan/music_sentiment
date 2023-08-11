@@ -11,8 +11,9 @@ from functools import reduce
 from tensorflow.keras.layers import (Input, MultiHeadAttention, Dense, LayerNormalization, 
                                      Add, Dropout, PReLU, GlobalAveragePooling1D, BatchNormalization)
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping
+from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping, LambdaCallback
 from tensorflow.keras.regularizers import l1, l2
+from tensorflow.keras.optimizers import Adam
 
 
 def extract_tar_gz(file_path, destination):
@@ -143,9 +144,6 @@ else:
     end_time = time.time()  # End timing
     print(f"Datasets saved in {end_time - start_time} seconds.")
 
-print(f"Number of training batches: {len(train_dataset)}")
-print(f"Number of validation batches: {len(test_dataset)}")
-
 def get_positional_encoding(seq_len, d_model):
     angles = np.arange(seq_len)[:, np.newaxis] / np.power(10000, (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model))
     pos_encoding = np.zeros(angles.shape)
@@ -195,12 +193,6 @@ num_heads = 4
 sample_features, _ = next(iter(train_dataset))
 input_shape = sample_features.shape[1:]
 
-print("Model Configuration:")
-print(f"d_model: {d_model}")
-print(f"dff: {dff}")
-print(f"num_heads: {num_heads}")
-print(f"Input Shape: {input_shape}")
-
 checkpoint_dir = "model_checkpoints"
 
 weights_file_path = os.path.join(checkpoint_dir, WEIGHTS_PATH)
@@ -218,25 +210,70 @@ else:
     print("No weights found. Initializing model with random weights.")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-model.compile(optimizer='adam', loss='mse')
+opt = Adam(learning_rate=0.2)
+model.compile(optimizer=opt, loss='mse')
 model.summary()
 
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001, verbose=1)
+def save_best_val_loss(val_loss, filename="best_val_loss.txt"):
+    with open(filename, 'w') as f:
+        f.write(str(val_loss))
+
+def load_best_val_loss(filename="best_val_loss.txt"):
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            return float(f.read().strip())
+    return float('inf')  # if file doesn't exist, set to infinity\
+
+best_val_loss_file = "best_val_loss.txt"
+
+original_best_val_loss = load_best_val_loss(best_val_loss_file)
+
+best_val_loss = original_best_val_loss
+
+def custom_checkpoint(epoch, logs):
+    global best_val_loss
+    
+    current_val_loss = logs.get('val_loss')
+
+    # Check if current validation loss is less than the previous best
+    if current_val_loss < best_val_loss:
+        # Save the model weights
+        model.save_weights(weights_file_path)
+
+        # Update the in-memory best validation loss
+        best_val_loss = current_val_loss
+        print(f"Epoch {epoch + 1}: New best model saved with validation loss: {current_val_loss:.4f}")
+
+def print_lr(epoch, logs):
+    # Get the current learning rate from the model's optimizer.
+    lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
+    print(f"Epoch {epoch + 1}: Learning Rate = {lr:.5f}")
+
+
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=5, min_lr=0.00001, verbose=1)
 early_stopping = EarlyStopping(monitor='val_loss', patience=20, verbose=1, restore_best_weights=True)
 
-checkpoint_callback = ModelCheckpoint(filepath=weights_file_path,
-                                      save_best_only=True,
-                                      save_weights_only=True,
-                                      monitor='val_loss',
-                                      verbose=1)
+custom_checkpoint_callback = LambdaCallback(on_epoch_end=custom_checkpoint)
+print_lr_callback = LambdaCallback(on_epoch_end=print_lr)
+callbacks_list = [custom_checkpoint_callback, early_stopping, print_lr_callback]
 
-callbacks_list = [reduce_lr, checkpoint_callback, early_stopping]
+try:
+    # Training the model
+    print(f"Starting model training for {EPOCHS} epochs...")
+    history = model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, callbacks=callbacks_list, verbose=1)
+    
+    final_train_loss = history.history['loss'][-1]
+    final_val_loss = history.history['val_loss'][-1]
+    print(f"Final Training Loss: {final_train_loss}")
+    print(f"Final Validation Loss: {final_val_loss}")
 
-# Training the model
-print(f"Starting model training for {EPOCHS} epochs...")
-history = model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, callbacks=callbacks_list, verbose=1)
+except Exception as e:
+    print(f"Training was interrupted with error: {e}")
 
-final_train_loss = history.history['loss'][-1]
-final_val_loss = history.history['val_loss'][-1]
-print(f"Final Training Loss: {final_train_loss}")
-print(f"Final Validation Loss: {final_val_loss}")
+finally:
+    # Only save if the in-memory best loss is better than the originally-loaded one
+    if best_val_loss < original_best_val_loss:
+        save_best_val_loss(best_val_loss, best_val_loss_file)
+        print("Updated best validation loss saved.")
+    else:
+        print("Best validation loss not improved from the original.")
