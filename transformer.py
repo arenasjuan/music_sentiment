@@ -37,36 +37,28 @@ list_of_all_columns = sample_df.columns.tolist()
 # Constants
 BATCH_SIZE = 32
 BUFFER_SIZE = 108120
-EPOCHS = 100 
+EPOCHS = 100
 WEIGHTS_PATH = 'transformer_weights.h5'
-TRAIN_DATASET_PATH = "serialized_data/train_dataset"
-TEST_DATASET_PATH = "serialized_data/test_dataset"
-
+TRAIN_DATASET_PATH = f"serialized_data/train_dataset_batch_{BATCH_SIZE}"
+TEST_DATASET_PATH = f"serialized_data/test_dataset_batch_{BATCH_SIZE}"
 os.makedirs(TRAIN_DATASET_PATH, exist_ok=True)
 os.makedirs(TEST_DATASET_PATH, exist_ok=True)
 FEATURE_COLS = [col_name for col_name in list_of_all_columns if col_name not in ["frameTime", "arousal", "valence"]]
 TARGET_COLS = ["arousal", "valence"]
 
-
-def gather_statistics(file_paths):
+def load_datasets(file_paths):
     dfs = [pd.read_csv(file) for file in file_paths]
     combined_df = pd.concat(dfs, axis=0)
-    mean = combined_df[FEATURE_COLS].mean()
-    std = combined_df[FEATURE_COLS].std()
+    return combined_df.copy()
+
+def gather_statistics(df):
+    mean = df[FEATURE_COLS].mean()
+    std = df[FEATURE_COLS].std()
     return mean, std
 
-print("Gathering statistics...")
-mean, std = gather_statistics(csv_files)
-print("Statistics gathered.")
-
-
-def load_and_preprocess_dataset(file_path, mean, std):
-    print(f"Loading and preprocessing {file_path}...")
-    df = pd.read_csv(file_path)
-    
+def load_and_preprocess_dataset(df, mean, std):
     for col in FEATURE_COLS:
-        df[col] = (df[col] - mean[col]) / std[col]
-    
+        df.loc[:, col] = (df[col] - mean[col]) / std[col]
     return df
 
 def dataframe_to_dataset(df):
@@ -77,72 +69,66 @@ def dataframe_to_dataset(df):
     return dataset
 
 pickle_filename = 'all_datasets.pkl'
+combined_df = load_datasets(csv_files)
 
-# Load preprocessed datasets if the pickle file exists
+dataset_size = len(combined_df)
+split_fraction = 0.8
+train_size = int(split_fraction * dataset_size)
+
+# Split the datasets into training and test first
+train_df = combined_df.iloc[:train_size].copy()
+test_df = combined_df.iloc[train_size:].copy()
+
+# Gather statistics only on the training set
+print("Gathering statistics...")
+mean, std = gather_statistics(train_df)
+print("Statistics gathered.")
+
 if os.path.exists(pickle_filename):
     with open(pickle_filename, 'rb') as f:
         all_dataframes = pickle.load(f)
     print("Loaded all_dataframes from pickle file.")
 else:
-    print("File containing all_datasets does not exist; now constructing...")
-    all_dataframes = [load_and_preprocess_dataset(file, mean, std) for file in csv_files]
+    all_dataframes = [load_and_preprocess_dataset(df_chunk, mean, std) for df_chunk in [train_df, test_df]]
     with open(pickle_filename, 'wb') as f:
         pickle.dump(all_dataframes, f)
     print("All dataframes loaded, preprocessed, and saved to pickle file.")
 
-# Convert the dtype of each DataFrame to float64 before converting to TensorFlow datasets
 all_dataframes = [df.astype('float64') for df in all_dataframes]
-
-# Convert preprocessed DataFrames back into TensorFlow datasets
 all_datasets = [dataframe_to_dataset(df) for df in all_dataframes]
 
 def safe_concatenate(ds_list):
-    """Attempt to concatenate datasets and return the problematic dataset index if an error occurs."""
     combined = ds_list[0]
     for idx, ds in enumerate(ds_list[1:], start=1):
         try:
             combined = combined.concatenate(ds)
         except Exception as e:
             print(f"Error encountered while concatenating dataset at index {idx}.")
-            # You can also print out samples from the problematic dataset to inspect them
             for sample in ds.take(1):
                 print(sample)
             raise e
     return combined
 
-print("Concatenating datasets...")
-start_time = time.time()
-combined_dataset = safe_concatenate(all_datasets)
-end_time = time.time()
-print(f"Datasets concatenated in {end_time - start_time} seconds.")
+train_dataset, test_dataset = all_datasets
 
 print("Checking for existing train and test datasets...")
-# Check if the directories themselves exist
-if os.path.isdir(TRAIN_DATASET_PATH) and os.path.isdir(TEST_DATASET_PATH):
+if os.path.exists(os.path.join(TRAIN_DATASET_PATH, "dataset_spec.pb")) and os.path.exists(os.path.join(TEST_DATASET_PATH, "dataset_spec.pb")):
     print("Loading existing train and test datasets...")
     train_dataset = tf.data.Dataset.load(TRAIN_DATASET_PATH)
     test_dataset = tf.data.Dataset.load(TEST_DATASET_PATH)
     print("Existing datasets loaded.")
 else:
-    dataset_size = 108120
-
-    split_fraction = 0.8
-    train_size = int(split_fraction * dataset_size)
-
-    print(f"Training size: {train_size} rows.")
-    print(f"Test size: {dataset_size - train_size} rows.")
-
     print("Splitting and shuffling datasets...")
-    train_dataset = combined_dataset.take(train_size).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
-    test_dataset = combined_dataset.skip(train_size).batch(BATCH_SIZE)
+    train_dataset = train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+    test_dataset = test_dataset.batch(BATCH_SIZE)
     print("Datasets split and shuffled.")
-
     print("Saving train and test datasets...")
-    start_time = time.time()  # Begin timing
+    start_time = time.time()
     train_dataset.save(TRAIN_DATASET_PATH)
     test_dataset.save(TEST_DATASET_PATH)
-    end_time = time.time()  # End timing
+    end_time = time.time()
     print(f"Datasets saved in {end_time - start_time} seconds.")
+
 
 def get_positional_encoding(seq_len, d_model):
     angles = np.arange(seq_len)[:, np.newaxis] / np.power(10000, (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model))
@@ -210,7 +196,7 @@ else:
     print("No weights found. Initializing model with random weights.")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-opt = Adam(learning_rate=0.2)
+opt = Adam(learning_rate=0.05)
 model.compile(optimizer=opt, loss='mse')
 model.summary()
 
@@ -250,8 +236,8 @@ def print_lr(epoch, logs):
     print(f"Epoch {epoch + 1}: Learning Rate = {lr:.5f}")
 
 
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=5, min_lr=0.00001, verbose=1)
-early_stopping = EarlyStopping(monitor='val_loss', patience=20, verbose=1, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001, verbose=1)
+early_stopping = EarlyStopping(monitor='val_loss', patience=35, verbose=1, restore_best_weights=True)
 
 custom_checkpoint_callback = LambdaCallback(on_epoch_end=custom_checkpoint)
 print_lr_callback = LambdaCallback(on_epoch_end=print_lr)

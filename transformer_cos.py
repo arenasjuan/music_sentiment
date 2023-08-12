@@ -213,7 +213,7 @@ else:
 batches_per_epoch = DATASET_SIZE // BATCH_SIZE
 epochs_per_reset = 10
 first_decay_steps = batches_per_epoch * epochs_per_reset
-initial_lr = 0.2
+initial_lr = 0.1
 lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(initial_lr, first_decay_steps)
 opt = Adam(learning_rate=lr_schedule)
 
@@ -248,7 +248,7 @@ def print_lr(epoch, logs):
     lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
     print(f"Epoch {epoch + 1}: Learning Rate = {lr:.5f}")
 
-early_stopping = EarlyStopping(monitor='val_loss', patience=20, verbose=1, restore_best_weights=True)
+early_stopping = EarlyStopping(monitor='val_loss', patience=35, verbose=1, restore_best_weights=True)
 custom_checkpoint_callback = LambdaCallback(on_epoch_end=custom_checkpoint)
 print_lr_callback = LambdaCallback(on_epoch_end=print_lr)
 callbacks_list = [custom_checkpoint_callback, early_stopping, print_lr_callback]
