@@ -35,39 +35,29 @@ sample_df = pd.read_csv(csv_files[0])
 list_of_all_columns = sample_df.columns.tolist()
 
 # Constants
-BATCH_SIZE = 32
-BUFFER_SIZE = 108120
-DATASET_SIZE = 108120
-EPOCHS = 100 
-WEIGHTS_PATH = 'transformer_cos_weights.h5'
-TRAIN_DATASET_PATH = "serialized_data/train_dataset"
-TEST_DATASET_PATH = "serialized_data/test_dataset"
-
+BATCH_SIZE = 10
+EPOCHS = 100
+WEIGHTS_PATH = 'transformer_weights.h5'
+TRAIN_DATASET_PATH = f"serialized_data/train_dataset_batch_{BATCH_SIZE}"
+TEST_DATASET_PATH = f"serialized_data/test_dataset_batch_{BATCH_SIZE}"
 os.makedirs(TRAIN_DATASET_PATH, exist_ok=True)
 os.makedirs(TEST_DATASET_PATH, exist_ok=True)
 FEATURE_COLS = [col_name for col_name in list_of_all_columns if col_name not in ["frameTime", "arousal", "valence"]]
 TARGET_COLS = ["arousal", "valence"]
 
-
-def gather_statistics(file_paths):
+def load_datasets(file_paths):
     dfs = [pd.read_csv(file) for file in file_paths]
     combined_df = pd.concat(dfs, axis=0)
-    mean = combined_df[FEATURE_COLS].mean()
-    std = combined_df[FEATURE_COLS].std()
+    return combined_df.copy()
+
+def gather_statistics(df):
+    mean = df[FEATURE_COLS].mean()
+    std = df[FEATURE_COLS].std()
     return mean, std
 
-print("Gathering statistics...")
-mean, std = gather_statistics(csv_files)
-print("Statistics gathered.")
-
-
-def load_and_preprocess_dataset(file_path, mean, std):
-    print(f"Loading and preprocessing {file_path}...")
-    df = pd.read_csv(file_path)
-    
+def load_and_preprocess_dataset(df, mean, std):
     for col in FEATURE_COLS:
-        df[col] = (df[col] - mean[col]) / std[col]
-    
+        df.loc[:, col] = (df[col] - mean[col]) / std[col]
     return df
 
 def dataframe_to_dataset(df):
@@ -78,70 +68,67 @@ def dataframe_to_dataset(df):
     return dataset
 
 pickle_filename = 'all_datasets.pkl'
+combined_df = load_datasets(csv_files)
 
-# Load preprocessed datasets if the pickle file exists
+dataset_size = len(combined_df)
+BUFFER_SIZE = dataset_size
+split_fraction = 0.8
+train_size = int(split_fraction * dataset_size)
+
+# Split the datasets into training and test first
+train_df = combined_df.iloc[:train_size].copy()
+test_df = combined_df.iloc[train_size:].copy()
+
+# Gather statistics only on the training set
+print("Gathering statistics...")
+mean, std = gather_statistics(train_df)
+print("Statistics gathered.")
+
 if os.path.exists(pickle_filename):
     with open(pickle_filename, 'rb') as f:
         all_dataframes = pickle.load(f)
     print("Loaded all_dataframes from pickle file.")
 else:
-    print("File containing all_datasets does not exist; now constructing...")
-    all_dataframes = [load_and_preprocess_dataset(file, mean, std) for file in csv_files]
+    all_dataframes = [load_and_preprocess_dataset(df_chunk, mean, std) for df_chunk in [train_df, test_df]]
     with open(pickle_filename, 'wb') as f:
         pickle.dump(all_dataframes, f)
     print("All dataframes loaded, preprocessed, and saved to pickle file.")
 
-# Convert the dtype of each DataFrame to float64 before converting to TensorFlow datasets
 all_dataframes = [df.astype('float64') for df in all_dataframes]
-
-# Convert preprocessed DataFrames back into TensorFlow datasets
 all_datasets = [dataframe_to_dataset(df) for df in all_dataframes]
 
 def safe_concatenate(ds_list):
-    """Attempt to concatenate datasets and return the problematic dataset index if an error occurs."""
     combined = ds_list[0]
     for idx, ds in enumerate(ds_list[1:], start=1):
         try:
             combined = combined.concatenate(ds)
         except Exception as e:
             print(f"Error encountered while concatenating dataset at index {idx}.")
-            # You can also print out samples from the problematic dataset to inspect them
             for sample in ds.take(1):
                 print(sample)
             raise e
     return combined
 
-print("Concatenating datasets...")
-start_time = time.time()
-combined_dataset = safe_concatenate(all_datasets)
-end_time = time.time()
-print(f"Datasets concatenated in {end_time - start_time} seconds.")
+train_dataset, test_dataset = all_datasets
 
 print("Checking for existing train and test datasets...")
-# Check if the directories themselves exist
-if os.path.isdir(TRAIN_DATASET_PATH) and os.path.isdir(TEST_DATASET_PATH):
+if os.path.exists(os.path.join(TRAIN_DATASET_PATH, "dataset_spec.pb")) and os.path.exists(os.path.join(TEST_DATASET_PATH, "dataset_spec.pb")):
     print("Loading existing train and test datasets...")
     train_dataset = tf.data.Dataset.load(TRAIN_DATASET_PATH)
     test_dataset = tf.data.Dataset.load(TEST_DATASET_PATH)
     print("Existing datasets loaded.")
 else:
-    split_fraction = 0.8
-    train_size = int(split_fraction * DATASET_SIZE)
-
-    print(f"Training size: {train_size} rows.")
-    print(f"Test size: {DATASET_SIZE - train_size} rows.")
-
     print("Splitting and shuffling datasets...")
-    train_dataset = combined_dataset.take(train_size).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
-    test_dataset = combined_dataset.skip(train_size).batch(BATCH_SIZE)
+    train_dataset = train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+    test_dataset = test_dataset.batch(BATCH_SIZE)
     print("Datasets split and shuffled.")
-
     print("Saving train and test datasets...")
-    start_time = time.time()  # Begin timing
+    start_time = time.time()
     train_dataset.save(TRAIN_DATASET_PATH)
     test_dataset.save(TEST_DATASET_PATH)
-    end_time = time.time()  # End timing
+    end_time = time.time()
     print(f"Datasets saved in {end_time - start_time} seconds.")
+
 
 def get_positional_encoding(seq_len, d_model):
     angles = np.arange(seq_len)[:, np.newaxis] / np.power(10000, (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model))
@@ -193,8 +180,8 @@ sample_features, _ = next(iter(train_dataset))
 input_shape = sample_features.shape[1:]
 
 checkpoint_dir = "model_checkpoints"
-weights_file_path = os.path.join(checkpoint_dir, WEIGHTS_PATH)
 
+weights_file_path = os.path.join(checkpoint_dir, WEIGHTS_PATH)
 print("Building model architecture...")
 model = build_transformer_model(input_shape, num_heads, d_model, dff)
 
@@ -210,10 +197,10 @@ else:
     os.makedirs(checkpoint_dir, exist_ok=True)
 
 # Cosine annealing with restarts
-batches_per_epoch = DATASET_SIZE // BATCH_SIZE
-epochs_per_reset = 10
-first_decay_steps = batches_per_epoch * epochs_per_reset
-initial_lr = 0.1
+batches_per_epoch = dataset_size // BATCH_SIZE
+epochs_per_reset = 0.5
+first_decay_steps = int(batches_per_epoch * epochs_per_reset)
+initial_lr = 0.01
 lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(initial_lr, first_decay_steps)
 opt = Adam(learning_rate=lr_schedule)
 
@@ -221,37 +208,38 @@ model.compile(optimizer=opt, loss='mse')
 model.summary()
 
 # Custom checkpointing logic
-def save_best_val_loss(val_loss, filename="best_val_loss_cos.txt"):
+def save_best_val_loss(val_loss, filename="best_val_loss.txt"):
     with open(filename, 'w') as f:
         f.write(str(val_loss))
 
-def load_best_val_loss(filename="best_val_loss_cos.txt"):
+def load_best_val_loss(filename="best_val_loss.txt"):
     if os.path.exists(filename):
         with open(filename, 'r') as f:
             return float(f.read().strip())
-    return float('inf')
+    return float('inf')  # if file doesn't exist, set to infinity
 
-best_val_loss_file = "best_val_loss_cos.txt"
+best_val_loss_file = "best_val_loss.txt"
 original_best_val_loss = load_best_val_loss(best_val_loss_file)
 best_val_loss = original_best_val_loss  # Initialize the in-memory best_val_loss with the loaded value
 
 def custom_checkpoint(epoch, logs):
     global best_val_loss
+    
     current_val_loss = logs.get('val_loss')
-    if current_val_loss < best_val_loss:
-        model.save_weights(weights_file_path)
-        best_val_loss = current_val_loss
-        print(f"Epoch {epoch + 1}: New best model saved with validation loss: {current_val_loss:.4f}")
 
-def print_lr(epoch, logs):
-    # Get the current learning rate from the model's optimizer.
-    lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
-    print(f"Epoch {epoch + 1}: Learning Rate = {lr:.5f}")
+    # Check if current validation loss is less than the previous best
+    if current_val_loss < best_val_loss:
+        # Save the model weights
+        model.save_weights(weights_file_path)
+
+        # Update the in-memory best validation loss
+        best_val_loss = current_val_loss
+        print(f"\n***NEW BEST MODEL*** Epoch {epoch + 1} model weights saved with validation loss: {current_val_loss:.4f}\n\n")
+
 
 early_stopping = EarlyStopping(monitor='val_loss', patience=35, verbose=1, restore_best_weights=True)
 custom_checkpoint_callback = LambdaCallback(on_epoch_end=custom_checkpoint)
-print_lr_callback = LambdaCallback(on_epoch_end=print_lr)
-callbacks_list = [custom_checkpoint_callback, early_stopping, print_lr_callback]
+callbacks_list = [custom_checkpoint_callback, early_stopping]
 
 try:
     print(f"Starting model training for {EPOCHS} epochs...")

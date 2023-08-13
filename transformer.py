@@ -11,7 +11,7 @@ from functools import reduce
 from tensorflow.keras.layers import (Input, MultiHeadAttention, Dense, LayerNormalization, 
                                      Add, Dropout, PReLU, GlobalAveragePooling1D, BatchNormalization)
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping, LambdaCallback
+from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping, LambdaCallback, Callback
 from tensorflow.keras.regularizers import l1, l2
 from tensorflow.keras.optimizers import Adam
 
@@ -35,8 +35,7 @@ sample_df = pd.read_csv(csv_files[0])
 list_of_all_columns = sample_df.columns.tolist()
 
 # Constants
-BATCH_SIZE = 32
-BUFFER_SIZE = 108120
+BATCH_SIZE = 5
 EPOCHS = 100
 WEIGHTS_PATH = 'transformer_weights.h5'
 TRAIN_DATASET_PATH = f"serialized_data/train_dataset_batch_{BATCH_SIZE}"
@@ -72,6 +71,7 @@ pickle_filename = 'all_datasets.pkl'
 combined_df = load_datasets(csv_files)
 
 dataset_size = len(combined_df)
+BUFFER_SIZE = dataset_size
 split_fraction = 0.8
 train_size = int(split_fraction * dataset_size)
 
@@ -172,6 +172,13 @@ def build_transformer_model(input_shape, num_heads, d_model, dff, rate=0.1, num_
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
+class PrintLoss(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        train_loss = logs.get('loss')
+        val_loss = logs.get('val_loss')
+        print(f"\nEnd of Epoch {epoch + 1} — val_loss: {val_loss:.10f}\n")
+
 d_model = 128
 dff = 512
 num_heads = 4
@@ -196,7 +203,7 @@ else:
     print("No weights found. Initializing model with random weights.")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-opt = Adam(learning_rate=0.05)
+opt = Adam(learning_rate=0.00001)
 model.compile(optimizer=opt, loss='mse')
 model.summary()
 
@@ -208,7 +215,7 @@ def load_best_val_loss(filename="best_val_loss.txt"):
     if os.path.exists(filename):
         with open(filename, 'r') as f:
             return float(f.read().strip())
-    return float('inf')  # if file doesn't exist, set to infinity\
+    return float('inf')  # if file doesn't exist, set to infinity
 
 best_val_loss_file = "best_val_loss.txt"
 
@@ -228,23 +235,17 @@ def custom_checkpoint(epoch, logs):
 
         # Update the in-memory best validation loss
         best_val_loss = current_val_loss
-        print(f"Epoch {epoch + 1}: New best model saved with validation loss: {current_val_loss:.4f}")
-
-def print_lr(epoch, logs):
-    # Get the current learning rate from the model's optimizer.
-    lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
-    print(f"Epoch {epoch + 1}: Learning Rate = {lr:.5f}")
+        print(f"\n***NEW BEST MODEL*** Epoch {epoch + 1} model weights saved with validation loss: {current_val_loss:.10f}\n\n")
 
 
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001, verbose=1)
-early_stopping = EarlyStopping(monitor='val_loss', patience=35, verbose=1, restore_best_weights=True)
-
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-11, verbose=1)
+early_stopping = EarlyStopping(monitor='val_loss', patience=EPOCHS, verbose=1, restore_best_weights=True)
 custom_checkpoint_callback = LambdaCallback(on_epoch_end=custom_checkpoint)
-print_lr_callback = LambdaCallback(on_epoch_end=print_lr)
-callbacks_list = [custom_checkpoint_callback, early_stopping, print_lr_callback]
+callbacks_list = [PrintLoss(), custom_checkpoint_callback, early_stopping, reduce_lr]
 
 try:
     # Training the model
+    print(f"Current best loss: {best_val_loss}")
     print(f"Starting model training for {EPOCHS} epochs...")
     history = model.fit(train_dataset, validation_data=test_dataset, epochs=EPOCHS, callbacks=callbacks_list, verbose=1)
     
@@ -253,13 +254,13 @@ try:
     print(f"Final Training Loss: {final_train_loss}")
     print(f"Final Validation Loss: {final_val_loss}")
 
-except Exception as e:
+except (Exception, KeyboardInterrupt) as e:
     print(f"Training was interrupted with error: {e}")
 
 finally:
     # Only save if the in-memory best loss is better than the originally-loaded one
     if best_val_loss < original_best_val_loss:
         save_best_val_loss(best_val_loss, best_val_loss_file)
-        print("Updated best validation loss saved.")
+        print("\nUpdated best validation loss saved.\n")
     else:
-        print("Best validation loss not improved from the original.")
+        print("\nBest validation loss not improved from the original.\n")
